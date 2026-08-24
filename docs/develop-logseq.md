@@ -75,6 +75,31 @@ pnpm release
 
 The released files will be at `static/` directory.
 
+### Disk-backed local web server
+
+The normal browser build stores its SQLite database in browser OPFS. To run the
+same UI with a graph database owned by a local Node process instead, build the
+browser app and start the disk-backed server with one graph:
+
+```bash
+pnpm release-app
+pnpm web:server -- --root-dir /absolute/path/to/logseq-data --repo logseq_db_notes
+```
+
+Open the `Logseq web UI` URL printed by the command. The server listens only on
+`127.0.0.1`, chooses an available port, and keeps the graph database under:
+
+```text
+<root-dir>/graphs/<encoded-graph-name>/db.sqlite
+<root-dir>/graphs/<encoded-graph-name>/assets/
+```
+
+The process owns the existing graph lock for its lifetime, so Desktop, CLI, and
+another web-server process cannot write the same graph concurrently. Stop it
+with `Ctrl-C`. The static browser build remains OPFS-backed when it is served by
+any other HTTP server because only this command injects the disk runtime
+configuration.
+
 ## Desktop app development
 
 ### Development

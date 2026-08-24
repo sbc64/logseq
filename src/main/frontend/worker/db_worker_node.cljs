@@ -4,8 +4,10 @@
             [clojure.string :as string]
             [frontend.worker.db-core :as db-core]
             [frontend.worker.db-worker-node-lock :as db-lock]
+            [frontend.worker.platform :as platform]
             [frontend.worker.platform.node :as platform-node]
             [frontend.worker.state :as worker-state]
+            [frontend.worker.web-server :as web-server]
             [lambdaisland.glogi :as log]
             [logseq.common.graph-dir :as graph-dir]
             [logseq.common.version :as build-version]
@@ -27,7 +29,7 @@
 
 (def ^:private cors-headers
   #js {"Access-Control-Allow-Origin" "lsp://logseq.com"
-       "Access-Control-Allow-Methods" "GET,POST,OPTIONS"
+       "Access-Control-Allow-Methods" "GET,HEAD,POST,OPTIONS"
        "Access-Control-Allow-Headers" "Content-Type,Authorization"})
 
 (defn- response-headers
@@ -48,6 +50,22 @@
   [^js res status text]
   (.writeHead res status (response-headers #js {"Content-Type" "text/plain"}))
   (.end res text))
+
+(defn- send-bytes!
+  [^js res status payload head?]
+  (.writeHead res status
+              (response-headers #js {"Content-Length" (.-byteLength payload)
+                                     "Content-Type" "application/octet-stream"}))
+  (if head?
+    (.end res)
+    (.end res payload)))
+
+(defn- send-byte-length!
+  [^js res status byte-length]
+  (.writeHead res status
+              (response-headers #js {"Content-Length" byte-length
+                                     "Content-Type" "application/octet-stream"}))
+  (.end res))
 
 (defn- <read-body-buffer
   [^js req]
@@ -79,6 +97,7 @@
           "--log-level" (recur (subvec args 2) (assoc opts :log-level (second args)))
           "--embedding-endpoint" (recur (subvec args 2) (assoc opts :embedding-endpoint (second args)))
           "--embedding-model-id" (recur (subvec args 2) (assoc opts :embedding-model-id (second args)))
+          "--ui-dir" (recur (subvec args 2) (assoc opts :ui-dir (second args)))
           "--create-empty-db" (recur (subvec args 1) (assoc opts :create-empty-db? true))
           "--version" (recur (subvec args 1) (assoc opts :version? true))
           "--help" (recur (subvec args 1) (assoc opts :help? true))
@@ -219,27 +238,130 @@
     (sequential? args) (first args)
     :else nil))
 
+(defn- bound-repo-error
+  [repo bound-repo]
+  (cond
+    (or (not (string? repo))
+        (string/blank? repo))
+    {:status 400
+     :error {:code :missing-repo
+             :message "repo is required"}}
+
+    (not (graph-dir/same-repo? repo bound-repo))
+    {:status 409
+     :error {:code :repo-mismatch
+             :message "repo does not match bound repo"
+             :repo repo
+             :bound-repo bound-repo}}
+
+    :else
+    nil))
+
 (defn- repo-error
   [method args bound-repo]
   (let [method-kw (normalize-method-kw method)]
     (when-not (contains? non-repo-methods method-kw)
-      (let [repo (repo-arg args)]
-        (cond
-          (or (not (string? repo))
-              (string/blank? repo))
-          {:status 400
-           :error {:code :missing-repo
-                   :message "repo is required"}}
+      (bound-repo-error (repo-arg args) bound-repo))))
 
-          (not (graph-dir/same-repo? repo bound-repo))
-          {:status 409
-           :error {:code :repo-mismatch
-                   :message "repo does not match bound repo"
-                   :repo repo
-                   :bound-repo bound-repo}}
+(def ^:private asset-path-prefix "/v1/assets/")
+(def ^:private asset-collection-path "/v1/assets")
 
-          :else
-          nil)))))
+(declare invoke-error-status invoke-error-code invoke-error-message)
+
+(defn- handle-asset-list-request!
+  [^js req ^js res parsed-url bound-repo]
+  (let [repo (.get (.-searchParams parsed-url) "repo")]
+    (if-let [{:keys [status error]} (bound-repo-error repo bound-repo)]
+      (send-json! res status {:ok false :error error})
+      (if (= "GET" (.-method req))
+        (-> (p/let [files (platform/asset-list (platform/current) repo)]
+              (send-json! res 200 {:ok true :files files}))
+            (p/catch (fn [error]
+                       (log/error :db-worker-node-asset-list-failed
+                                  {:repo repo :error error})
+                       (send-json! res 500 {:ok false
+                                           :error {:code :asset-list-failed
+                                                   :message (or (.-message error)
+                                                                "asset list failed")}}))))
+        (send-text! res 405 "method-not-allowed")))))
+
+(defn- asset-file-name
+  [request-path]
+  (when (string/starts-with? request-path asset-path-prefix)
+    (try
+      (let [file-name (js/decodeURIComponent
+                       (subs request-path (count asset-path-prefix)))]
+        (when (and (not (string/blank? file-name))
+                   (not (contains? #{"." ".."} file-name))
+                   (not (re-find #"[/\\\u0000]" file-name)))
+          file-name))
+      (catch :default _
+        nil))))
+
+(defn- asset-error-status
+  [error]
+  (if (= "ENOENT" (.-code error)) 404 500))
+
+(defn- handle-asset-request!
+  [^js req ^js res parsed-url request-path bound-repo]
+  (let [repo (.get (.-searchParams parsed-url) "repo")
+        file-name (asset-file-name request-path)
+        method (.-method req)]
+    (cond
+      (nil? file-name)
+      (send-json! res 400 {:ok false
+                           :error {:code :invalid-asset-file-name
+                                   :message "asset file name is invalid"}})
+
+      :else
+      (if-let [{:keys [status error]} (bound-repo-error repo bound-repo)]
+        (send-json! res status {:ok false :error error})
+        (case method
+          "GET"
+          (-> (p/let [payload (platform/asset-read-bytes! (platform/current)
+                                                           repo file-name)]
+                (send-bytes! res 200 payload false))
+              (p/catch (fn [error]
+                         (let [status (asset-error-status error)]
+                           (when (= 500 status)
+                             (log/error :db-worker-node-asset-read-failed
+                                        {:repo repo :file-name file-name :error error}))
+                           (send-json! res status {:ok false
+                                                  :error {:code :asset-read-failed
+                                                          :message (or (.-message error)
+                                                                       "asset read failed")}})))))
+
+          "HEAD"
+          (-> (p/let [stat (platform/asset-stat (platform/current) repo file-name)]
+                (if (:is-file? stat)
+                  (send-byte-length! res 200 (:size stat))
+                  (send-json! res 404 {:ok false
+                                       :error {:code :asset-not-found
+                                               :message "asset not found"}})))
+              (p/catch (fn [error]
+                         (log/error :db-worker-node-asset-stat-failed
+                                    {:repo repo :file-name file-name :error error})
+                         (send-json! res 500 {:ok false
+                                             :error {:code :asset-stat-failed
+                                                     :message (or (.-message error)
+                                                                  "asset stat failed")}}))))
+
+          "POST"
+          (-> (p/let [payload (<read-body-buffer req)
+                      _ (let [{:keys [path lock]} @*lock-info]
+                          (db-lock/assert-lock-owner! path lock))
+                      _ (platform/asset-write-bytes! (platform/current)
+                                                     repo file-name payload)]
+                (send-json! res 200 {:ok true}))
+              (p/catch (fn [error]
+                         (log/error :db-worker-node-asset-write-failed
+                                    {:repo repo :file-name file-name :error error})
+                         (send-json! res (invoke-error-status (ex-data error))
+                                     {:ok false
+                                      :error {:code (invoke-error-code (ex-data error))
+                                              :message (invoke-error-message error (ex-data error))}}))))
+
+          (send-text! res 405 "method-not-allowed"))))))
 
 (defn- set-main-thread-stub!
   []
@@ -308,7 +430,7 @@
     (send-json! res status payload)))
 
 (defn- make-server
-  [proxy {:keys [bound-repo stop-fn host port owner-source root-dir]}]
+  [proxy {:keys [bound-repo stop-fn host port owner-source root-dir ui-dir]}]
   (http/createServer
    (fn [^js req ^js res]
      (let [url (.-url req)
@@ -329,6 +451,12 @@
 
          (= request-path "/v1/events")
          (sse-handler req res)
+
+         (= request-path asset-collection-path)
+         (handle-asset-list-request! req res parsed-url bound-repo)
+
+         (string/starts-with? request-path asset-path-prefix)
+         (handle-asset-request! req res parsed-url request-path bound-repo)
 
          (= request-path "/v1/import-db-binary")
          (if (= method "POST")
@@ -394,6 +522,11 @@
                             10))
            (send-text! res 405 "method-not-allowed"))
 
+         ui-dir
+         (web-server/handle-request! req res {:ui-dir ui-dir
+                                              :repo bound-repo
+                                              :request-path request-path})
+
          :else
          (send-text! res 404 "not-found"))))))
 
@@ -405,6 +538,7 @@
   (println (str "  " (style/bold "--create-empty-db") "  (start with empty initial datoms)"))
   (println (str "  " (style/bold "--embedding-endpoint") " <url>"))
   (println (str "  " (style/bold "--embedding-model-id") " <id>"))
+  (println (str "  " (style/bold "--ui-dir") " <path>      (serve the browser UI on this daemon)"))
   (println (str "  " (style/bold "--log-level") " <level>  (default info)"))
   (println (str "  " (style/bold "--version") "            (print build metadata and exit)"))
   (println "  logs: <root-dir>/graphs/<graph-dir>/db-worker-node-YYYYMMDD.log (retains 7)"))
@@ -500,7 +634,7 @@
               :stop! stop!})))
 
 (defn- start-http-server!
-  [{:keys [proxy repo host port owner-source root-dir on-stopped!]}]
+  [{:keys [proxy repo host port owner-source root-dir ui-dir on-stopped!]}]
   (let [stop!* (atom nil)
         stopped? (atom false)
         port* (atom nil)
@@ -509,6 +643,7 @@
                                    :port port*
                                    :owner-source owner-source
                                    :root-dir root-dir
+                                   :ui-dir ui-dir
                                    :stop-fn (fn []
                                               (when-let [stop! @stop!*]
                                                 (stop!)))})]
@@ -547,6 +682,8 @@
       :else
       (try
         (let [root-dir (root-dir/ensure-root-dir! root-dir)
+              ui-dir (when (:ui-dir opts)
+                       (web-server/resolve-ui-dir! (:ui-dir opts)))
               server-list-file (server-list-file-path root-dir)]
           (db-worker-log/install! {:root-dir root-dir
                                    :repo repo
@@ -579,6 +716,7 @@
                                      :port port
                                      :owner-source owner-source
                                      :root-dir root-dir
+                                     :ui-dir ui-dir
                                      :on-stopped! on-stopped!}))
               (p/catch (fn [e]
                          (when-let [lock-path (:path @*lock-info)]
@@ -610,11 +748,14 @@
                                 :owner-source owner-source
                                 :embedding-endpoint (:embedding-endpoint opts)
                                 :embedding-model-id (:embedding-model-id opts)
+                                :ui-dir (:ui-dir opts)
                                 :on-stopped! (fn []
                                                (log/info :db-worker-node-stopped nil)
                                                (.exit js/process 0))
                                 :log-level (:log-level opts)})]
           (log/info :db-worker-node-ready {:host (:host daemon) :port (:port daemon)})
+          (when (:ui-dir opts)
+            (println (str "Logseq web UI: http://" (:host daemon) ":" (:port daemon))))
           (let [shutdown (fn [] (stop!))]
             (.on js/process "SIGINT" shutdown)
             (.on js/process "SIGTERM" shutdown)))

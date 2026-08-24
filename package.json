@@ -105,6 +105,7 @@
     "db-worker-node:bundle": "node ./scripts/build-db-worker-node-bundle.mjs",
     "db-worker-node:release:bundle": "run-s db-worker-node:release db-worker-node:bundle",
     "db-worker-node:compile:bundle": "run-s db-worker-node:compile db-worker-node:bundle",
+    "web:server": "node ./static/db-worker-node.js --ui-dir ./static",
     "cli:release": "pnpm --dir cli bundle && node ./scripts/stage-cli-runtime.mjs",
     "desktop:prepare-runtime-js": "node ./scripts/prepare-desktop-runtime-js.mjs",
     "cli:e2e": "bb dev:cli-e2e",

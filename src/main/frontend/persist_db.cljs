@@ -38,6 +38,46 @@
   [repo runtime-repo]
   (graph-dir/same-repo? repo runtime-repo))
 
+(defn- node-runtime?
+  []
+  (and (exists? js/process)
+       (not (exists? js/window))))
+
+(defn- electron-runtime?
+  []
+  (and (not (node-runtime?))
+       (util/electron?)))
+
+(defn- web-server-runtime
+  []
+  (config/web-server-runtime))
+
+(defn- remote-runtime?
+  []
+  (or (electron-runtime?)
+      (some? (web-server-runtime))))
+
+(defn- <acquire-remote-runtime!
+  [repo]
+  (if (electron-runtime?)
+    (ipc/ipc "db-worker-runtime" repo)
+    (if-let [runtime (web-server-runtime)]
+      (if (same-remote-repo? repo (:repo runtime))
+        (p/resolved runtime)
+        (p/rejected (ex-info "repo does not match web server graph"
+                             {:code :repo-mismatch
+                              :repo repo
+                              :bound-repo (:repo runtime)})))
+      (p/rejected (ex-info "remote runtime is not available"
+                           {:code :db-worker-unavailable
+                            :repo repo})))))
+
+(defn- <release-remote-runtime!
+  [repo]
+  (if (electron-runtime?)
+    (ipc/ipc "releaseDbWorkerRuntime" repo)
+    (p/resolved true)))
+
 (defn- <stop-remote-if-current!
   [repo]
   (if (and repo (same-remote-repo? repo @remote-repo))
@@ -105,7 +145,7 @@
   (if (active-runtime-client? @remote-runtime-state repo session-id remote-client)
     (p/let [_ (do
                 (clear-remote-runtime!)
-                (ipc/ipc "releaseDbWorkerRuntime" repo))]
+                (<release-remote-runtime! repo))]
       true)
     (do
       (log/info :event :db-worker-runtime-recovery-skipped
@@ -167,16 +207,6 @@
       (when @triggered?
         (<trigger-db-worker-runtime-recovery! repo @remote-client session-id))
       nil)))
-
-(defn- node-runtime?
-  []
-  (and (exists? js/process)
-       (not (exists? js/window))))
-
-(defn- electron-runtime?
-  []
-  (and (not (node-runtime?))
-       (util/electron?)))
 
 (defn- current-db-sync-config
   []
@@ -243,7 +273,7 @@
                (log/warn :event :db-worker-ensure-remote-stale
                          :repo repo :phase :before-runtime)
                nil)
-             (p/let [runtime (ipc/ipc "db-worker-runtime" repo)
+             (p/let [runtime (<acquire-remote-runtime! repo)
                      client (remote/start! (assoc runtime
                                                   :repo repo
                                                   :event-handler worker-handler/handle
@@ -278,7 +308,7 @@
                                              (log/info :event :db-worker-stale-release-skipped
                                                        :repo repo
                                                        :reason :runtime-changed)
-                                             (ipc/ipc "releaseDbWorkerRuntime" repo))]
+                                             (<release-remote-runtime! repo))]
                                    nil)))
                        (p/catch (fn [e]
                                   (log/warn :event :db-worker-stale-release-error
@@ -302,8 +332,9 @@
 (defn <start-runtime!
   []
   (cond
-    (electron-runtime?)
-    (if-let [repo (state/get-current-repo)]
+    (remote-runtime?)
+    (if-let [repo (or (:repo (web-server-runtime))
+                      (state/get-current-repo))]
       (<ensure-remote! repo)
       (p/resolved nil))
 
@@ -316,23 +347,25 @@
   opfs-db)
 
 (defn <list-db []
-  (if (electron-runtime?)
-    (if-let [repo (or @remote-repo (state/get-current-repo))]
-      (p/let [client (<ensure-remote! repo)]
-        (protocol/<list-db client))
-      (p/resolved []))
-    (protocol/<list-db (get-impl))))
+  (if-let [runtime (web-server-runtime)]
+    (p/resolved [{:name (:repo runtime)}])
+    (if (electron-runtime?)
+      (if-let [repo (or @remote-repo (state/get-current-repo))]
+        (p/let [client (<ensure-remote! repo)]
+          (protocol/<list-db client))
+        (p/resolved []))
+      (protocol/<list-db (get-impl)))))
 
 (defn <unsafe-delete [repo]
   (when repo
-    (if (electron-runtime?)
+    (if (remote-runtime?)
       (p/let [client (<ensure-remote! repo)]
         (protocol/<unsafe-delete client repo))
       (protocol/<unsafe-delete (get-impl) repo))))
 
 (defn <close-db [repo]
   (when repo
-    (if (electron-runtime?)
+    (if (remote-runtime?)
       (if (same-remote-repo? repo @remote-repo)
         (if-let [remote-client @remote-db]
           (p/let [_ (-> (remote/invoke! (:client remote-client) "thread-api/close-db" [repo])
@@ -346,12 +379,15 @@
 (defn <export-db
   [repo opts]
   (when repo
-    (protocol/<export-db (get-impl) repo opts)))
+    (if (web-server-runtime)
+      (p/let [client (<ensure-remote! repo)]
+        (protocol/<export-db client repo opts))
+      (protocol/<export-db (get-impl) repo opts))))
 
 (defn <import-db
   [repo data]
   (when repo
-    (if (electron-runtime?)
+    (if (remote-runtime?)
       (p/let [client (<ensure-remote! repo)]
         (protocol/<import-db client repo data))
       (protocol/<import-db (get-impl) repo data))))
@@ -361,7 +397,7 @@
    (<open-and-fetch-schema repo {}))
   ([repo opts]
    (when repo
-     (if (electron-runtime?)
+     (if (remote-runtime?)
        (p/let [client (<ensure-remote! repo)]
          (protocol/<open-and-fetch-schema client repo opts))
        (protocol/<open-and-fetch-schema (get-impl) repo opts)))))
@@ -370,7 +406,7 @@
 ;; @shuyu Do we still need this?
 (defn <new [repo opts]
   {:pre [(<= (count repo) 128)]}
-  (p/let [impl (if (electron-runtime?)
+  (p/let [impl (if (remote-runtime?)
                  (<ensure-remote! repo)
                  (p/resolved (get-impl)))
           _ (protocol/<new impl repo opts)]

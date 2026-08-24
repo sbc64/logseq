@@ -34,6 +34,7 @@ second local writer.
 | --- | --- | --- |
 | Browser renderer | UI, editor state, worker client | None directly |
 | Browser db-worker | Graph transactions and queries | SQLite through OPFS |
+| Local web-server renderer | UI and localhost persistence client | None directly |
 | Desktop renderer | UI and remote persistence client | None directly |
 | Electron main | Window and db-worker-node lifecycle | Filesystem coordination |
 | db-worker-node | Graph transactions, queries, sync, search | Filesystem SQLite |
@@ -56,7 +57,8 @@ Primary source map:
 | --- | --- |
 | Worker database and thread APIs | src/main/frontend/worker/ |
 | Browser persistence | src/main/frontend/persist_db/browser.cljs |
-| Desktop remote persistence | src/main/frontend/persist_db/remote.cljs |
+| Renderer remote persistence | src/main/frontend/persist_db/remote.cljs |
+| Local UI serving | src/main/frontend/worker/web_server.cljs |
 | Electron runtime manager | src/electron/electron/db_worker.cljs |
 | Shared daemon lifecycle | src/main/logseq/cli/server.cljs |
 | Node daemon | src/main/frontend/worker/db_worker_node.cljs |
@@ -116,12 +118,20 @@ Client-facing endpoints:
 | --- | --- | --- |
 | GET | /healthz | Readiness, bound repo, process, owner, revision, host, and port |
 | GET | /v1/events | Server-Sent Events from worker broadcasts |
+| GET | /v1/assets?repo=... | List graph asset files |
+| GET/HEAD/POST | /v1/assets/<file>?repo=... | Read, inspect, or write a graph asset |
 | POST | /v1/import-db-binary?repo=... | Stream a SQLite database import |
 | POST | /v1/invoke | Invoke a worker thread API with Transit arguments |
 | POST | /v1/shutdown | Graceful close and process shutdown |
 
 The daemon also answers CORS preflight requests. It binds to `127.0.0.1` on an
 OS-selected port and has no remote-bind option.
+
+When started directly with `--ui-dir`, the daemon also serves the compiled
+browser application and an injected single-graph runtime configuration. That
+renderer uses the same HTTP/SSE persistence client as Desktop while the normal
+hosted browser build continues to use OPFS. Static paths are contained within
+the configured UI directory, and the daemon remains localhost-only.
 
 Most thread APIs require the first argument to identify the repo. The daemon
 rejects:

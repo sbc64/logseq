@@ -8,6 +8,7 @@
             [frontend.fs.memory-fs :as memory-fs]
             [frontend.fs.node :as node]
             [frontend.fs.protocol :as protocol]
+            [frontend.persist-db.remote :as remote]
             [frontend.state :as state]
             [frontend.util :as util]
             [lambdaisland.glogi :as log]
@@ -18,6 +19,18 @@
 
 (defonce memory-backend (memory-fs/->MemoryFs))
 (defonce node-backend (node/->Node))
+
+(defn- remote-asset-target
+  [dir rpath]
+  (when-let [runtime (config/web-server-runtime)]
+    (let [full-path (common-util/path-normalize (path/path-join dir rpath))
+          [_ file-name] (re-find #"(?:^|/)assets(?:/([^/]+))?/?$" full-path)]
+      (when (or file-name
+                (string/ends-with? full-path "/assets"))
+        {:runtime runtime
+         :repo (:repo runtime)
+         :file-name file-name
+         :directory? (nil? file-name)}))))
 
 (defn- get-native-backend
   "Native FS backend of current platform"
@@ -51,16 +64,25 @@
 
 (defn mkdir-recur!
   [dir]
-  (protocol/mkdir-recur! (get-fs dir) dir))
+  (if-let [{:keys [directory?]} (remote-asset-target dir "")]
+    (if directory?
+      (p/resolved nil)
+      (p/rejected (ex-info "asset path is not a directory" {:path dir})))
+    (protocol/mkdir-recur! (get-fs dir) dir)))
 
 (defn readdir
   "list all absolute paths in dir, absolute"
   [dir & {:keys [path-only?]}]
   (when-not path-only?
     (js/console.error "BUG: (deprecation) path-only? is always true"))
-  (p/let [result (protocol/readdir (get-fs dir) dir)
-          result (bean/->clj result)]
-    (map common-util/path-normalize result)))
+  (if-let [{:keys [runtime repo directory?]} (remote-asset-target dir "")]
+    (if directory?
+      (p/let [file-names (remote/<list-assets runtime repo)]
+        (map #(common-util/path-normalize (path/path-join dir %)) file-names))
+      (p/rejected (ex-info "asset path is not a directory" {:path dir})))
+    (p/let [result (protocol/readdir (get-fs dir) dir)
+            result (bean/->clj result)]
+      (map common-util/path-normalize result))))
 
 (defn unlink!
   "Should move the path to logseq/recycle instead of deleting it."
@@ -118,15 +140,17 @@
 (defn write-asset-file!
   [repo file-name data]
   (let [repo-dir (config/get-repo-dir repo)]
-    (if (util/electron?)
-      (let [assets-dir (path/path-join repo-dir common-config/local-assets-dir)
-            file-path (path/path-join assets-dir file-name)]
-        ;; Use writeFileBytes directly instead of ipc/ipc (write-file!) because
-        ;; binary data like ArrayBuffer can't be transit-serialized
-        (js/window.apis.writeFileBytes file-path data))
-      (let [file-path (path/path-join common-config/local-assets-dir file-name)]
-        (write-plain-text-file! repo repo-dir file-path data {:skip-transact? true
-                                                              :skip-compare? true})))))
+    (if-let [runtime (config/web-server-runtime)]
+      (remote/<write-asset! runtime repo file-name data)
+      (if (util/electron?)
+        (let [assets-dir (path/path-join repo-dir common-config/local-assets-dir)
+              file-path (path/path-join assets-dir file-name)]
+          ;; Use writeFileBytes directly instead of ipc/ipc (write-file!) because
+          ;; binary data like ArrayBuffer can't be transit-serialized
+          (js/window.apis.writeFileBytes file-path data))
+        (let [file-path (path/path-join common-config/local-assets-dir file-name)]
+          (write-plain-text-file! repo repo-dir file-path data {:skip-transact? true
+                                                                :skip-compare? true}))))))
 
 ;; read-file should return string on all platforms
 (defn read-file
@@ -141,15 +165,35 @@
 
 (defn read-file-raw
   [dir path & {:as options}]
-  (let [fs (get-fs dir)]
-    (protocol/read-file-raw fs dir path options)))
+  (if-let [{:keys [runtime repo file-name directory?]} (remote-asset-target dir path)]
+    (if directory?
+      (p/rejected (ex-info "asset path is a directory" {:dir dir :path path}))
+      (remote/<read-asset runtime repo file-name))
+    (let [fs (get-fs dir)]
+      (protocol/read-file-raw fs dir path options))))
+
+(defn- <remote-asset-stat
+  [{:keys [runtime repo file-name directory?]}]
+  (if directory?
+    (p/resolved #js {:type "dir"})
+    (p/let [exists? (remote/<asset-exists? runtime repo file-name)]
+      (if exists?
+        #js {:type "file"}
+        (throw (ex-info "asset does not exist"
+                        {:code :asset-not-found
+                         :repo repo
+                         :file-name file-name}))))))
 
 (defn stat
   ([fpath]
-   (protocol/stat (get-fs fpath) fpath))
+   (if-let [target (remote-asset-target fpath "")]
+     (<remote-asset-stat target)
+     (protocol/stat (get-fs fpath) fpath)))
   ([dir path]
-   (let [fpath (path/path-join dir path)]
-     (protocol/stat (get-fs dir) fpath))))
+   (if-let [target (remote-asset-target dir path)]
+     (<remote-asset-stat target)
+     (let [fpath (path/path-join dir path)]
+       (protocol/stat (get-fs dir) fpath)))))
 
 (defn mkdir-if-not-exists
   [dir]

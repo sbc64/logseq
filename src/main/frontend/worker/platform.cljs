@@ -106,6 +106,13 @@
                     {:repo repo
                      :file-name file-name}))))
 
+(defn asset-list
+  [platform repo]
+  (if-let [f (get-in platform [:storage :asset-list])]
+    (f repo)
+    (throw (ex-info "platform storage/asset-list missing"
+                    {:repo repo}))))
+
 (defn save-secret-text!
   [platform key text]
   (if-let [f (get-in platform [:crypto :save-secret-text!])]

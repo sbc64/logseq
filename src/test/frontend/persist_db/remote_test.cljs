@@ -235,3 +235,35 @@
           (p/catch (fn [e]
                      (is false (str "unexpected error: " e))))
           (p/finally (fn [] (done)))))))
+
+(deftest remote-assets-use-raw-same-origin-endpoints
+  (async done
+    (let [requests (atom [])
+          payload (js/ArrayBuffer. 3)
+          client {:base-url "http://127.0.0.1:9101"
+                  :fetch-fn (fn [request]
+                              (swap! requests conj request)
+                              (case (:method request)
+                                "POST" (p/resolved {:status 200 :body ""})
+                                "HEAD" (p/resolved {:status 200 :body ""})
+                                "GET"
+                                (if (= "array-buffer" (:response-type request))
+                                  (p/resolved {:status 200 :body payload})
+                                  (p/resolved {:status 200
+                                               :body (js/JSON.stringify
+                                                      #js {:ok true
+                                                           :files #js ["asset.png"]})}))))}]
+      (-> (p/let [_ (remote/<write-asset! client "graph-a" "asset.png" payload)
+                  exists? (remote/<asset-exists? client "graph-a" "asset.png")
+                  result (remote/<read-asset client "graph-a" "asset.png")
+                  files (remote/<list-assets client "graph-a")]
+            (is exists?)
+            (is (identical? payload result))
+            (is (= ["asset.png"] files))
+            (is (= ["POST" "HEAD" "GET" "GET"] (mapv :method @requests)))
+            (is (= "http://127.0.0.1:9101/v1/assets/asset.png?repo=graph-a"
+                   (:url (first @requests))))
+            (is (identical? payload (:body (first @requests)))))
+          (p/catch (fn [e]
+                     (is false (str "unexpected error: " e))))
+          (p/finally (fn [] (done)))))))

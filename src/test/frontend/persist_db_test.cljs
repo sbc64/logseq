@@ -285,6 +285,64 @@
     (is (= #{1 2 4 8 16 32 64 128}
            (set (filter loggable? (range 1 130)))))))
 
+(deftest web-server-runtime-starts-bound-disk-client
+  (async done
+    (let [repo "logseq_db_web_graph"
+          runtime {:repo repo
+                   :base-url "http://127.0.0.1:9123"}
+          start-calls (atom [])
+          ipc-calls (atom [])
+          wrapped-worker (fn [& _] (p/resolved nil))]
+      (reset-runtime-state!)
+      (-> (p/with-redefs [config/web-server-runtime (constantly runtime)
+                          util/electron? (constantly false)
+                          ipc/ipc (fn [& args]
+                                    (swap! ipc-calls conj args)
+                                    (p/rejected (ex-info "unexpected ipc" {:args args})))
+                          remote/start! (fn [opts]
+                                          (swap! start-calls conj
+                                                 (select-keys opts [:repo :base-url]))
+                                          (->FakeRemote repo wrapped-worker))
+                          remote/stop! (fn [_] (p/resolved true))]
+            (p/let [_ (persist-db/<start-runtime!)
+                    repos (persist-db/<list-db)
+                    result (persist-db/<open-and-fetch-schema repo {})]
+              (is (= [{:repo repo
+                       :base-url (:base-url runtime)}]
+                     @start-calls))
+              (is (= [{:name repo}] repos))
+              (is (= {:schema {:repo repo}} result))
+              (is (= wrapped-worker @state/*db-worker))
+              (is (empty? @ipc-calls))))
+          (p/catch (fn [e]
+                     (is false (str "unexpected error: " e))))
+          (p/finally (fn []
+                       (reset-runtime-state!)
+                       (done)))))))
+
+(deftest web-server-runtime-rejects-a-different-graph
+  (async done
+    (let [runtime {:repo "logseq_db_bound"
+                   :base-url "http://127.0.0.1:9123"}
+          start-calls (atom [])]
+      (reset-runtime-state!)
+      (-> (p/with-redefs [config/web-server-runtime (constantly runtime)
+                          util/electron? (constantly false)
+                          remote/start! (fn [opts]
+                                          (swap! start-calls conj opts)
+                                          (->FakeRemote (:repo opts) (fn [& _] nil)))]
+            (<capture-result
+             (persist-db/<open-and-fetch-schema "logseq_db_other" {})))
+          (p/then (fn [result]
+                    (is (= :rejected (:status result)))
+                    (is (= :repo-mismatch (-> result :error ex-data :code)))
+                    (is (empty? @start-calls))))
+          (p/catch (fn [e]
+                     (is false (str "unexpected error: " e))))
+          (p/finally (fn []
+                       (reset-runtime-state!)
+                       (done)))))))
+
 (deftest electron-open-and-fetch-schema-starts-remote-runtime
   (async done
     (let [ipc-calls (atom [])

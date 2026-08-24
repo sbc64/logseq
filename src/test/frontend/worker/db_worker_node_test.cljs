@@ -9,6 +9,7 @@
             [frontend.worker.db-worker-node :as db-worker-node]
             [frontend.worker.db-worker-node-lock :as db-lock]
             [frontend.worker.platform.node :as platform-node]
+            [frontend.worker.web-server :as web-server]
             [goog.object :as gobj]
             [logseq.cli.config :as cli-config]
             [logseq.cli.server :as cli-server]
@@ -421,6 +422,14 @@
     (is (= "logseq_db_parse_args" (:repo result)))
     (is (= true (:create-empty-db? result)))))
 
+(deftest db-worker-node-parse-args-recognizes-ui-dir
+  (let [parse-args #'db-worker-node/parse-args
+        result (parse-args #js ["node" "dist/db-worker-node.js"
+                                "--repo" "logseq_db_parse_args"
+                                "--ui-dir" "/tmp/logseq-ui"])]
+    (is (= "logseq_db_parse_args" (:repo result)))
+    (is (= "/tmp/logseq-ui" (:ui-dir result)))))
+
 (deftest db-worker-node-parse-args-ignores-server-list-file
   (let [parse-args #'db-worker-node/parse-args
         result (parse-args #js ["node" "dist/db-worker-node.js"
@@ -620,8 +629,95 @@
     (is (string/includes? plain-output "(required)"))
     (is (string/includes? plain-output "--create-empty-db"))
     (is (contains-bold? output "--create-empty-db"))
+    (is (contains-bold? output "--ui-dir"))
     (is (not (contains-bold? output "--rtc-ws-url")))
     (is (contains-bold? output "--log-level"))))
+
+(deftest web-server-static-file-resolution-stays-inside-ui-dir
+  (let [parent-dir (node-helper/create-tmp-dir "db-worker-web-paths")
+        ui-dir (node-path/join parent-dir "ui")
+        index-path (node-path/join ui-dir "index.html")
+        outside-path (node-path/join parent-dir "secret.txt")]
+    (fs/mkdirSync ui-dir #js {:recursive true})
+    (fs/writeFileSync index-path "<html>Logseq</html>")
+    (fs/writeFileSync (node-path/join ui-dir "app.js") "console.log('app')")
+    (fs/writeFileSync outside-path "secret")
+    (let [resolved-ui-dir (web-server/resolve-ui-dir! ui-dir)]
+      (is (= (fs/realpathSync index-path)
+             (web-server/resolve-static-file resolved-ui-dir "/")))
+      (is (= (fs/realpathSync (node-path/join ui-dir "app.js"))
+             (web-server/resolve-static-file resolved-ui-dir "/static/app.js")))
+      (is (nil? (web-server/resolve-static-file resolved-ui-dir "/static/")))
+      (is (nil? (web-server/resolve-static-file resolved-ui-dir
+                                                "/%2e%2e%2fsecret.txt")))
+      (is (nil? (web-server/resolve-static-file resolved-ui-dir "/missing.js"))))))
+
+(deftest db-worker-node-serves-ui-with-disk-backed-graph-config
+  (async done
+         (let [daemon (atom nil)
+               data-dir (node-helper/create-tmp-dir "db-worker-web-data")
+               ui-dir (node-helper/create-tmp-dir "db-worker-web-ui")
+               repo (str "logseq_db_web_" (subs (str (random-uuid)) 0 8))
+               index-body "<html><body>Logseq web</body></html>"
+               app-body "console.log('app')"
+               asset-file-name "asset-id.txt"
+               asset-body "disk asset"
+               db-path (node-path/join (node-path/dirname (lock-path data-dir repo))
+                                       "db.sqlite")
+               asset-path (node-path/join (node-path/dirname (lock-path data-dir repo))
+                                          "assets"
+                                          asset-file-name)]
+           (fs/writeFileSync (node-path/join ui-dir "index.html") index-body)
+           (fs/writeFileSync (node-path/join ui-dir "app.js") app-body)
+           (-> (p/let [{:keys [host port stop!]}
+                       (start-daemon! {:root-dir data-dir
+                                       :repo repo
+                                       :ui-dir ui-dir})
+                       _ (reset! daemon {:stop! stop!})
+                       index-response (http-get host port "/")
+                       app-response (http-get host port "/app.js")
+                       static-app-response (http-get host port "/static/app.js")
+                       config-response (http-get host port "/web-server-config.js")
+                       traversal-response (http-get host port "/%2e%2e%2fsecret.txt")
+                       asset-response (http-request {:hostname host
+                                                     :port port
+                                                     :path (str "/v1/assets/" asset-file-name
+                                                                "?repo=" (js/encodeURIComponent repo))
+                                                     :method "POST"
+                                                     :headers {"Content-Type" "application/octet-stream"}}
+                                                    asset-body)
+                       read-asset-response (http-get host port
+                                                     (str "/v1/assets/" asset-file-name
+                                                          "?repo=" (js/encodeURIComponent repo)))
+                       list-assets-response (http-get host port
+                                                      (str "/v1/assets?repo="
+                                                           (js/encodeURIComponent repo)))]
+                 (is (= 200 (:status index-response)))
+                 (is (= index-body (:body index-response)))
+                 (is (= 200 (:status app-response)))
+                 (is (= app-body (:body app-response)))
+                 (is (= 200 (:status static-app-response)))
+                 (is (= app-body (:body static-app-response)))
+                 (is (= 200 (:status config-response)))
+                 (is (string/includes? (:body config-response)
+                                       "window.__LOGSEQ_WEB_SERVER__"))
+                 (is (string/includes? (:body config-response)
+                                       (js/JSON.stringify repo)))
+                 (is (= 404 (:status traversal-response)))
+                 (is (= 200 (:status asset-response)))
+                 (is (= 200 (:status read-asset-response)))
+                 (is (= asset-body (:body read-asset-response)))
+                 (is (= [asset-file-name]
+                        (:files (js->clj (js/JSON.parse (:body list-assets-response))
+                                        :keywordize-keys true))))
+                 (is (fs/existsSync db-path))
+                 (is (= asset-body (.toString (fs/readFileSync asset-path) "utf8"))))
+               (p/catch (fn [e]
+                          (is false (str "unexpected error: " e))))
+               (p/finally (fn []
+                            (if-let [stop! (:stop! @daemon)]
+                              (-> (stop!) (p/finally done))
+                              (done))))))))
 
 (deftest db-worker-node-start-daemon-uses-empty-datoms-when-create-empty-enabled
   (async done

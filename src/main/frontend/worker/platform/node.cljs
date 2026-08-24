@@ -551,6 +551,22 @@
                  :is-file? (.isFile stat)}))
       (p/catch (constantly nil))))
 
+(defn- asset-list
+  [data-dir repo]
+  (let [dir (node-path/join (repo-dir data-dir repo)
+                            common-config/local-assets-dir)]
+    (-> (fs/readdir dir #js {:withFileTypes true})
+        (p/then (fn [entries]
+                  (->> entries
+                       (filter #(.isFile ^js %))
+                       (map #(.-name ^js %))
+                       sort
+                       vec)))
+        (p/catch (fn [error]
+                   (if (= "ENOENT" (.-code error))
+                     []
+                     (throw error)))))))
+
 (defn- asset-delete!
   [write-guard-fn data-dir repo file-name]
   (let [full-path (asset-file-path data-dir repo file-name)]
@@ -727,6 +743,8 @@
                                        (asset-write-bytes! write-guard-fn data-dir repo file-name payload))
                  :asset-stat (fn [repo file-name]
                                (asset-stat data-dir repo file-name))
+                 :asset-list (fn [repo]
+                               (asset-list data-dir repo))
                  :asset-delete! (fn [repo file-name]
                                   (asset-delete! write-guard-fn data-dir repo file-name))}
        :kv {:get (:get kv)

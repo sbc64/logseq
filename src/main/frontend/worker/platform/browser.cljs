@@ -155,6 +155,20 @@
                    :type (.-type stat)}))
         (p/catch (constantly nil)))))
 
+(defn- asset-list
+  [repo]
+  (let [^js pfs (browser-pfs)
+        dir (graph-assets-dir repo)]
+    (if (and pfs dir)
+      (-> (.readdir pfs dir)
+          (p/then #(-> % js->clj sort vec))
+          (p/catch (fn [error]
+                     (if (or (= "ENOENT" (.-code error))
+                             (= "NotFoundError" (.-name error)))
+                       []
+                       (throw error)))))
+      (p/resolved []))))
+
 (defn- asset-delete!
   [repo file-name]
   (let [^js pfs (browser-pfs)]
@@ -216,6 +230,7 @@
              :asset-read-bytes! asset-read-bytes!
              :asset-write-bytes! asset-write-bytes!
              :asset-stat asset-stat
+             :asset-list asset-list
              :asset-delete! asset-delete!
              :transfer (fn [data transferables]
                          (Comlink/transfer data transferables))}

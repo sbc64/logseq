@@ -5,6 +5,7 @@
             [frontend.state :as state]
             [frontend.util :as util]
             [goog.crypt.Md5]
+            [goog.object :as gobj]
             [logseq.common.cognito-config :as cognito-config]
             [logseq.common.config :as common-config]
             [logseq.common.graph-dir :as common-graph-dir]
@@ -17,6 +18,24 @@
 (defonce dev? ^boolean (or dev-release? goog.DEBUG))
 
 (defonce publishing? common-config/PUBLISHING)
+
+(defn web-server-runtime
+  "Return the runtime injected by the local disk-backed web server."
+  []
+  (when (exists? js/window)
+    (when-let [runtime (gobj/get js/window "__LOGSEQ_WEB_SERVER__")]
+      (let [repo (gobj/get runtime "repo")
+            base-url (some-> js/window .-location .-origin)]
+        (when-not (and (string? repo) (not (string/blank? repo)))
+          (throw (ex-info "web server runtime is missing repo"
+                          {:code :invalid-web-server-runtime})))
+        (when-not (and (string? base-url)
+                       (re-find #"^https?://" base-url))
+          (throw (ex-info "web server runtime has an invalid origin"
+                          {:code :invalid-web-server-runtime
+                           :origin base-url})))
+        {:repo repo
+         :base-url base-url}))))
 
 ;; this is a feature flag to enable the account tab
 ;; when it launches (when pro plan launches) it should be removed

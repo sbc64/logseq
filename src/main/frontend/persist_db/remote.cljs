@@ -1,5 +1,5 @@
 (ns frontend.persist-db.remote
-  "Remote `PersistentDB` implementation for Electron renderer via db-worker-node HTTP and SSE."
+  "Remote `PersistentDB` implementation for browser renderers via db-worker-node HTTP and SSE."
   (:require [clojure.string :as string]
             [frontend.persist-db.protocol :as protocol]
             [logseq.db :as ldb]
@@ -25,6 +25,20 @@
 (defn- events-url
   [base-url]
   (str (normalize-base-url base-url) "/v1/events"))
+
+(defn- asset-url
+  [base-url repo file-name]
+  (str (normalize-base-url base-url)
+       "/v1/assets/"
+       (js/encodeURIComponent file-name)
+       "?repo="
+       (js/encodeURIComponent repo)))
+
+(defn- asset-collection-url
+  [base-url repo]
+  (str (normalize-base-url base-url)
+       "/v1/assets?repo="
+       (js/encodeURIComponent repo)))
 
 (defn- base-headers
   [auth-token]
@@ -74,13 +88,15 @@
 (defn create-client
   [{:keys [fetch-fn open-sse-fn schedule-fn reconnect-delay-ms] :as opts}]
   (let [default-fetch-fn
-        (fn [{:keys [method url headers body]}]
+        (fn [{:keys [method url headers body response-type]}]
           (p/let [^js res (js/fetch url (clj->js (cond-> {:method method
                                                           :headers (or headers {})}
                                                    body (assoc :body body))))
-                  text (.text res)]
+                  response-body (if (= "array-buffer" response-type)
+                                  (.arrayBuffer res)
+                                  (.text res))]
             {:status (.-status res)
-             :body text}))
+             :body response-body}))
         default-open-sse-fn
         (fn [{:keys [url on-message on-error]}]
           (if (exists? js/EventSource)
@@ -102,6 +118,68 @@
            :schedule-fn (or schedule-fn (fn [f delay-ms]
                                           (js/setTimeout f delay-ms)))
            :reconnect-delay-ms (or reconnect-delay-ms 1000))))
+
+(defn <read-asset
+  [{:keys [base-url auth-token] :as opts} repo file-name]
+  (let [{:keys [fetch-fn]} (create-client opts)]
+    (p/let [{:keys [status body]}
+            (fetch-fn {:method "GET"
+                       :url (asset-url base-url repo file-name)
+                       :headers (base-headers auth-token)
+                       :response-type "array-buffer"})]
+      (if (= 200 status)
+        body
+        (throw (ex-info "asset read failed"
+                        {:code :asset-read-failed
+                         :status status
+                         :repo repo
+                         :file-name file-name}))))))
+
+(defn <write-asset!
+  [{:keys [base-url auth-token] :as opts} repo file-name payload]
+  (let [{:keys [fetch-fn]} (create-client opts)]
+    (p/let [{:keys [status]}
+            (fetch-fn {:method "POST"
+                       :url (asset-url base-url repo file-name)
+                       :headers (binary-headers auth-token)
+                       :body payload})]
+      (when-not (= 200 status)
+        (throw (ex-info "asset write failed"
+                        {:code :asset-write-failed
+                         :status status
+                         :repo repo
+                         :file-name file-name})))
+      nil)))
+
+(defn <asset-exists?
+  [{:keys [base-url auth-token] :as opts} repo file-name]
+  (let [{:keys [fetch-fn]} (create-client opts)]
+    (p/let [{:keys [status]}
+            (fetch-fn {:method "HEAD"
+                       :url (asset-url base-url repo file-name)
+                       :headers (base-headers auth-token)})]
+      (case status
+        200 true
+        404 false
+        (throw (ex-info "asset stat failed"
+                        {:code :asset-stat-failed
+                         :status status
+                         :repo repo
+                         :file-name file-name}))))))
+
+(defn <list-assets
+  [{:keys [base-url auth-token] :as opts} repo]
+  (let [{:keys [fetch-fn]} (create-client opts)]
+    (p/let [{:keys [status body]}
+            (fetch-fn {:method "GET"
+                       :url (asset-collection-url base-url repo)
+                       :headers (base-headers auth-token)})]
+      (if (= 200 status)
+        (:files (parse-response-body body))
+        (throw (ex-info "asset list failed"
+                        {:code :asset-list-failed
+                         :status status
+                         :repo repo}))))))
 
 (defn invoke!
   [{:keys [base-url auth-token fetch-fn on-invoke-success on-invoke-failure]} method args]
