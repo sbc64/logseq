@@ -28,6 +28,46 @@ Verified on a snapshot of `logseq_og`: the original `:apply-template` request
 changed from HTTP 500 to HTTP 200 after repairing 17 references to four
 Properties (`til`, `time`, `link`, `run`). A second repair run made no changes.
 
+## Server backups
+
+The microVM runs `logseq-backup.service` hourly through
+`logseq-backup.timer`, including a missed run after boot. The deployment lives
+in `lab.nix`: `hosts/visionary-vole/microvm/logseq.nix` and
+`pkgs/logseq-backup.mjs`.
+
+Each completed backup is stored under
+`/var/lib/logseq/graphs/logseq_og/backup/server-<timestamp>-<suffix>/`:
+
+```text
+db.sqlite
+metadata.edn
+markdown/
+  index.json
+  pages/*.md
+  journals/*.md
+```
+
+The script takes a consistent snapshot through the live worker's SQLite backup
+API. It starts a separate worker on a disposable copy, exports each page with
+Logseq's Markdown formatter, and publishes the backup directory only after all
+exports succeed. Both formats therefore come from the same snapshot. Exports
+include page and block properties; the index records original titles and UUIDs
+for filenames that require normalization or collision suffixes. SQLite remains
+the complete database backup, including records without a page identity.
+
+Existing backups are retained. An export failure leaves a hidden
+`.server-backup-*` directory containing the SQLite snapshot and diagnostic log;
+it is not published as a completed backup. Assets remain in the graph's assets
+directory and are not copied into these backups.
+
+Run and inspect a backup inside the VM with:
+
+```bash
+systemctl start logseq-backup.service
+systemctl list-timers logseq-backup.timer
+journalctl -u logseq-backup.service
+```
+
 ## Local static browser service
 
 This configuration builds the browser version of

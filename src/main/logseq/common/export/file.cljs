@@ -49,9 +49,10 @@
 
 (defn- property-values->seq
   [db property v context]
-  (if (set? v)
-    (sort-by #(property-value-sort-key db property % context) v)
-    [v]))
+  (cond
+    (set? v) (sort-by #(property-value-sort-key db property % context) v)
+    (sequential? v) v
+    :else [v]))
 
 (defn- property-values->string
   [db property v context]
