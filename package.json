@@ -76,6 +76,7 @@
     "test": "run-s cljs:test cljs:run-test",
     "test:ios-web-fonts": "node ./scripts/check-ios-web-fonts.mjs",
     "test:node-adapter": "pnpm --dir deps/db-sync run test:node-adapter",
+    "test:web-server-cache": "node ./scripts/test/logseq/web-server-cache.mjs",
     "report": "run-s cljs:report",
     "style:lint": "stylelint \"src/**/*.css\"",
     "gulp:watch": "gulp watch",

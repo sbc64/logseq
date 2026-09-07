@@ -1,6 +1,7 @@
 (ns frontend.worker.web-server
   "Static application serving for the disk-backed browser runtime."
-  (:require ["fs" :as fs]
+  (:require ["crypto" :as crypto]
+            ["fs" :as fs]
             ["path" :as node-path]
             [clojure.string :as string]))
 
@@ -114,17 +115,44 @@
                      body
                      head?)))
 
+(defonce ^:private *file-etags (atom {}))
+
+(defn- file-etag
+  [file-path stat]
+  (let [signature [(.-size stat) (.-mtimeMs stat) (.-ctimeMs stat)]
+        cached (get @*file-etags file-path)]
+    (if (= signature (:signature cached))
+      (:etag cached)
+      (let [etag (str "\"" (-> (crypto/createHash "sha256")
+                               (.update (fs/readFileSync file-path))
+                               (.digest "hex")) "\"")]
+        (swap! *file-etags assoc file-path {:signature signature :etag etag})
+        etag))))
+
+(defn- etag-matches?
+  [if-none-match etag]
+  (and (string? if-none-match)
+       (some (fn [candidate]
+               (let [candidate (string/trim candidate)]
+                 (or (= "*" candidate)
+                     (= etag (string/replace-first candidate #"^W/" "")))))
+             (string/split if-none-match #","))))
+
 (defn- serve-file!
-  [^js res file-path head?]
+  [^js req ^js res file-path head?]
   (let [stat (fs/statSync file-path)
+        etag (file-etag file-path stat)
+        not-modified? (etag-matches? (aget (.-headers req) "if-none-match") etag)
         content-type (get extension->content-type
                           (string/lower-case (node-path/extname file-path))
-                          "application/octet-stream")]
-    (.writeHead res 200
-                #js {"Cache-Control" "no-cache"
-                     "Content-Length" (.-size stat)
-                     "Content-Type" content-type})
-    (if head?
+                          "application/octet-stream")
+        headers (cond-> {"Cache-Control" "private, no-cache"
+                         "ETag" etag}
+                  (not not-modified?)
+                  (assoc "Content-Length" (.-size stat)
+                         "Content-Type" content-type))]
+    (.writeHead res (if not-modified? 304 200) (clj->js headers))
+    (if (or head? not-modified?)
       (.end res)
       (.pipe (fs/createReadStream file-path) res))))
 
@@ -142,6 +170,6 @@
 
       :else
       (if-let [file-path (resolve-static-file ui-dir request-path)]
-        (serve-file! res file-path head?)
+        (serve-file! req res file-path head?)
         (write-response! res 404 {"Content-Type" "text/plain; charset=utf-8"}
                          "not-found" head?)))))
